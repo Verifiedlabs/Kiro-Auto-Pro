@@ -74,3 +74,26 @@ env/
 kiro_auto_manager-master/
 .trae/
 
+# GSuite accounts and their use-state — NEVER commit
+accounts/*.txt
+accounts/*.state.json
+accounts/*.json
+!accounts/gsuite.example.txt
+!accounts/vcc.example.json
+
+# Registration output
+show/results.json
+show/builderid-template.json
+show/switch-state.json
+show/upgrade-results.json
+show/upgrade-state.json
+show/diagnostics/
+show/sessions/
+show/*.bak.*
+
+# Playwright MCP runtime state
+.playwright-mcp/
+
+# Local reference screenshots
+opus-memasak-*.png
+

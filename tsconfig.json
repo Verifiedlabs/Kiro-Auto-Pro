@@ -14,5 +14,5 @@
     "sourceMap": true
   },
   "include": ["scripts/**/*", "lib/**/*", "types/**/*"],
-  "exclude": ["node_modules", "dist", "output"]
+  "exclude": ["node_modules", "dist", "output", "lib/fingerprint/manager.ts"]
 }

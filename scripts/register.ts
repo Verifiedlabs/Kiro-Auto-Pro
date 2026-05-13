@@ -1,9 +1,11 @@
 import { mkdir, writeFile, readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { resolve, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { execSync } from 'node:child_process'
-import { registerAwsBuilderIdTempMail } from '../lib/register'
-import { startBuilderIdDeviceLogin, pollBuilderIdDeviceAuth } from '../lib/auth'
+import { registerKiroWithGoogle } from '../lib/register'
+import { AccountPool } from '../lib/accounts'
+import type { BrowserEngine } from '../lib/browser'
+import type { KiroSession } from '../lib/google-login'
 
 if (process.platform === 'win32') {
   try {
@@ -23,12 +25,15 @@ type CliOptions = {
   concurrency: number
   delayMs: number
   proxyUrl?: string
-  incognitoMode: boolean
+  headless: boolean
   useFingerprint: boolean
-  outputPath: string
-  region: string
-  emitBuilderIdTemplate: boolean
-  templateOutputPath: string
+  engine: BrowserEngine
+  humanize: boolean
+  geoip: boolean
+  resultsPath: string
+  sessionsDir: string
+  accountsPath: string
+  accountsStatePath: string
 }
 
 const COLORS = {
@@ -62,7 +67,6 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
     if (idx === -1) return undefined
     return argv[idx + 1]
   }
-
   const has = (name: string) => argv.includes(name)
 
   const result: Partial<CliOptions> = {}
@@ -79,30 +83,24 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
   if (has('--proxyUrl') || has('--proxy')) {
     result.proxyUrl = get('--proxyUrl') ?? get('--proxy')
   }
-  if (has('--output')) {
-    result.outputPath = get('--output')
+  if (has('--results')) result.resultsPath = get('--results')
+  if (has('--sessionsDir')) result.sessionsDir = get('--sessionsDir')
+  if (has('--accounts')) result.accountsPath = get('--accounts')
+  if (has('--accounts-state')) result.accountsStatePath = get('--accounts-state')
+  if (has('--engine')) {
+    const e = get('--engine')
+    if (e === 'camoufox' || e === 'chromium-stealth' || e === 'chromium-vanilla') {
+      result.engine = e
+    }
   }
-  if (has('--region')) {
-    result.region = get('--region')
-  }
-  if (has('--emit-builderid-template') || has('--emit-builderid') || has('--builderid-template')) {
-    result.emitBuilderIdTemplate = true
-  }
-  if (has('--templateOutput')) {
-    result.templateOutputPath = get('--templateOutput')
-  }
-  if (has('--incognito')) {
-    result.incognitoMode = true
-  }
-  if (has('--no-incognito')) {
-    result.incognitoMode = false
-  }
-  if (has('--fingerprint')) {
-    result.useFingerprint = true
-  }
-  if (has('--no-fingerprint')) {
-    result.useFingerprint = false
-  }
+  if (has('--headed')) result.headless = false
+  if (has('--headless')) result.headless = true
+  if (has('--no-fingerprint')) result.useFingerprint = false
+  if (has('--fingerprint')) result.useFingerprint = true
+  if (has('--no-humanize')) result.humanize = false
+  if (has('--humanize')) result.humanize = true
+  if (has('--no-geoip')) result.geoip = false
+  if (has('--geoip')) result.geoip = true
 
   return result
 }
@@ -122,15 +120,13 @@ async function runWithConcurrency<TItem>(
   worker: (item: TItem, idx: number) => Promise<void>
 ) {
   let nextIdx = 0
-
-  const runners = Array.from({ length: concurrency }, async () => {
+  const runners = Array.from({ length: Math.max(1, concurrency) }, async () => {
     while (true) {
       const idx = nextIdx++
       if (idx >= items.length) return
       await worker(items[idx], idx)
     }
   })
-
   await Promise.all(runners)
 }
 
@@ -139,444 +135,326 @@ const DEFAULT_OPTIONS: CliOptions = {
   concurrency: 1,
   delayMs: 0,
   proxyUrl: undefined,
-  incognitoMode: true,
+  headless: true,
   useFingerprint: true,
-  outputPath: 'show/results.json',
-  region: 'us-east-1',
-  emitBuilderIdTemplate: true,
-  templateOutputPath: 'show/builderid-template.json'
+  engine: 'camoufox',
+  humanize: true,
+  geoip: true,
+  resultsPath: 'show/results.json',
+  sessionsDir: 'show/sessions',
+  accountsPath: 'accounts/gsuite.txt',
+  accountsStatePath: 'accounts/gsuite.state.json'
+}
+
+type RunRecord = {
+  email: string
+  success: boolean
+  error?: string
+  reason?: string
+  sessionFile?: string
+  cookieCount?: number
+  capturedAt?: number
+  // Extracted auth tokens (Cognito-issued). Populated on success.
+  accessToken?: string
+  idToken?: string
+  refreshToken?: string
+  cognitoUsername?: string
+  cognitoClientId?: string
+}
+
+function safeEmailSlug(email: string): string {
+  return email.replace(/[^a-zA-Z0-9._-]+/g, '_')
+}
+
+async function saveSession(sessionsDir: string, session: KiroSession): Promise<string> {
+  const absDir = resolve(sessionsDir)
+  await mkdir(absDir, { recursive: true })
+  const fname = `${safeEmailSlug(session.email)}.${session.capturedAt}.json`
+  const abs = join(absDir, fname)
+  await writeFile(abs, JSON.stringify(session, null, 2), 'utf-8')
+  return abs
 }
 
 async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: number }> {
-  const outPathAbs = resolve(opts.outputPath)
-  const outDirAbs = resolve(opts.outputPath, '..')
-  await mkdir(outDirAbs, { recursive: true })
+  const resultsAbs = resolve(opts.resultsPath)
+  await mkdir(resolve(opts.resultsPath, '..'), { recursive: true })
+  await mkdir(resolve(opts.sessionsDir), { recursive: true })
 
-  const startedAt = Date.now()
-  const total = Math.max(1, opts.count)
+  const pool = await AccountPool.open(opts.accountsPath, opts.accountsStatePath, (m) =>
+    process.stdout.write(`[accounts] ${m}\n`)
+  )
 
-  const logInfo = (msg: string) => {
-    process.stdout.write(`${msg}\n`)
+  const available = pool.availableCount()
+  if (available === 0) {
+    log('red', `No unused GSuite accounts in ${resolve(opts.accountsPath)}`)
+    log(
+      'dim',
+      `   total: ${pool.totalCount()} | success: ${pool.successCount()} | failed: ${pool.failedCount()}`
+    )
+    return { ok: 0, fail: 0 }
   }
 
-  const funnyMessages = [
-    '奥里给！冲！',
-    '干就完了！',
-    '怕什么！干！',
-    '冲冲冲！',
-    '不要怂！就是干！',
-    '奥里给！',
-    '干就完事了！',
-    '冲啊兄弟们！',
-    '不要怕！上！',
-    '奥里给！冲冲冲！'
-  ]
+  const effectiveCount = Math.min(opts.count, available)
+  if (effectiveCount < opts.count) {
+    log(
+      'yellow',
+      `Requested ${opts.count} but only ${available} accounts unused — running ${effectiveCount}`
+    )
+  }
 
-  const getRandomFunny = () => funnyMessages[Math.floor(Math.random() * funnyMessages.length)]
+  const startedAt = Date.now()
+  const records: RunRecord[] = new Array(effectiveCount)
 
-  logInfo(`🔥 奥里给！准备造 ${opts.count} 个账号！并发 ${opts.concurrency} 个！`)
-  logInfo(`   (AWS: 你们礼貌吗？？？)\n`)
+  const tasks = Array.from({ length: effectiveCount }, (_, i) => i)
 
-  const templateOutAbs = resolve(opts.templateOutputPath)
-  
-  const allRecords: Array<{
-    email?: string
-    password?: string
-    name?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    success: boolean
-    error?: string
-  }> = new Array(total).fill(null)
+  if (opts.proxyUrl) {
+    process.env.HTTP_PROXY = opts.proxyUrl
+    process.env.HTTPS_PROXY = opts.proxyUrl
+    process.env.http_proxy = opts.proxyUrl
+    process.env.https_proxy = opts.proxyUrl
+  }
 
-  let completed = 0
-
-  const tasks = Array.from({ length: total }, (_, i) => i)
-
-  await runWithConcurrency(tasks, opts.concurrency, async (idx) => {
+  await runWithConcurrency(tasks, opts.concurrency, async (_, idx) => {
     if (opts.delayMs > 0 && idx > 0) {
       await new Promise((r) => setTimeout(r, opts.delayMs))
     }
-
     const taskNum = idx + 1
-    const log = (message: string) => {
-      const funny = getRandomFunny()
-      process.stdout.write(`[${funny}] 第${taskNum}号选手: ${message}\n`)
+    const taskLog = (m: string) => process.stdout.write(`[#${taskNum}] ${m}\n`)
+
+    const claim = await pool.claimNext()
+    if (!claim) {
+      records[idx] = { email: '(none)', success: false, error: 'No available account on claim' }
+      return
     }
+    const { account, release } = claim
 
     try {
-      // 设置代理环境变量（让 fetch 请求也走代理）
-      if (opts.proxyUrl) {
-        process.env.HTTP_PROXY = opts.proxyUrl
-        process.env.HTTPS_PROXY = opts.proxyUrl
-        process.env.http_proxy = opts.proxyUrl
-        process.env.https_proxy = opts.proxyUrl
-      }
-      
-      log('正在向 AWS 伸手要设备码...')
-      const start = await startBuilderIdDeviceLogin(opts.region)
-      if (!start.success) {
-        throw new Error(start.error)
-      }
-
-      log(`拿到 userCode: ${start.userCode}，浏览器启动！自动化走起！`)
-
-      const result = await registerAwsBuilderIdTempMail({
-        log,
+      const result = await registerKiroWithGoogle({
+        email: account.email,
+        password: account.password,
+        log: taskLog,
         proxyUrl: opts.proxyUrl,
-        incognitoMode: opts.incognitoMode,
-        userCode: start.userCode,
-        verificationUri: start.verificationUri,
-        useFingerprint: opts.useFingerprint
+        engine: opts.engine,
+        headless: opts.headless,
+        useFingerprint: opts.useFingerprint,
+        humanize: opts.humanize,
+        geoip: opts.geoip
       })
 
-      let refreshToken: string | undefined
-      let clientId: string | undefined
-      let clientSecret: string | undefined
-
-      if (opts.emitBuilderIdTemplate && result.success) {
-        const endAt = start.expiresAt
-        let intervalMs = Math.max(1000, start.interval * 1000)
-
-        log('等 AWS 确认中...（它可能懵了）')
-        while (Date.now() < endAt) {
-          const poll = await pollBuilderIdDeviceAuth({
-            region: opts.region,
-            clientId: start.clientId,
-            clientSecret: start.clientSecret,
-            deviceCode: start.deviceCode
-          })
-
-          if (!poll.success) {
-            throw new Error(poll.error)
-          }
-
-          if (poll.completed) {
-            refreshToken = poll.refreshToken
-            clientId = poll.clientId
-            clientSecret = poll.clientSecret
-            break
-          }
-
-          if (poll.status === 'slow_down') {
-            intervalMs += 5000
-            log('AWS 说：慢点慢点！你太快了！')
-          }
-
-          await new Promise((r) => setTimeout(r, intervalMs))
+      if (!result.success) {
+        records[idx] = {
+          email: account.email,
+          success: false,
+          error: result.error,
+          reason: result.reason as string | undefined
         }
+        await release({ status: 'failed', reason: result.error })
+        taskLog(`FAILED: ${result.error}`)
+        return
       }
 
-      allRecords[idx] = {
+      const sessionFile = await saveSession(opts.sessionsDir, result.session)
+      records[idx] = {
         email: result.email,
-        password: result.password,
-        name: result.name,
-        refreshToken,
-        clientId,
-        clientSecret,
-        success: result.success,
-        error: result.error
+        success: true,
+        sessionFile,
+        cookieCount: result.session.cookies.length,
+        capturedAt: result.session.capturedAt,
+        accessToken: result.session.tokens.accessToken,
+        idToken: result.session.tokens.idToken,
+        refreshToken: result.session.tokens.refreshToken,
+        cognitoUsername: result.session.tokens.cognitoUsername,
+        cognitoClientId: result.session.tokens.cognitoClientId
       }
-
-      completed++
-      if (result.success) {
-        log(`✅ 拿下！邮箱: ${result.email}！AWS 又损失一员大将！`)
-      } else {
-        log(`❌ 翻车了: ${result.error}...AWS 这波防住了`)
-      }
+      await release({ status: 'success' })
+      const tokenSummary = result.session.tokens.refreshToken
+        ? `refreshToken=${result.session.tokens.refreshToken.substring(0, 24)}…`
+        : 'no refreshToken found'
+      taskLog(`OK: ${tokenSummary} | session → ${sessionFile}`)
     } catch (e) {
-      completed++
-      allRecords[idx] = {
-        success: false,
-        error: e instanceof Error ? e.message : String(e)
-      }
-      log(`💥 炸了: ${allRecords[idx]!.error}！但是不要慌！`)
+      const msg = e instanceof Error ? e.message : String(e)
+      records[idx] = { email: account.email, success: false, error: msg }
+      await release({ status: 'failed', reason: msg })
+      taskLog(`ERROR: ${msg}`)
     }
   })
 
-  const ok = allRecords.filter(r => r?.success).length
-  const fail = allRecords.filter(r => r && !r.success).length
-  const elapsedMs = Date.now() - startedAt
-  const elapsedSec = Math.round(elapsedMs / 1000)
-
-  const successRecords = allRecords.filter(r => r?.success && r?.refreshToken)
+  const ok = records.filter((r) => r?.success).length
+  const fail = records.filter((r) => r && !r.success).length
+  const elapsed = Math.round((Date.now() - startedAt) / 1000)
 
   print('')
   if (ok > 0 && fail === 0) {
-    log('green', `🎉 奥里给！${ok} 个账号全部拿下！耗时 ${elapsedSec} 秒！`)
-    log('cyan', `   AWS: "我太难了..."`)
+    log('green', `${ok}/${effectiveCount} accounts registered in ${elapsed}s`)
   } else if (ok > 0) {
-    log('yellow', `😅 还行！拿下 ${ok} 个，翻车 ${fail} 个，耗时 ${elapsedSec} 秒`)
-    log('dim', `   (翻车的那些...下次再战！)`)
+    log('yellow', `${ok} OK, ${fail} failed in ${elapsed}s`)
   } else {
-    log('red', `💀 全军覆没！一个都没成！耗时 ${elapsedSec} 秒`)
-    log('dim', `   (是不是网不行？还是 AWS 开挂了？)`)
+    log('red', `all ${effectiveCount} attempts failed in ${elapsed}s`)
   }
 
-  await writeFile(outPathAbs, JSON.stringify(allRecords.filter(Boolean), null, 2), { encoding: 'utf-8' })
-  log('green', `\n📁 结果文件已保存: ${outPathAbs}`)
-
-  if (opts.emitBuilderIdTemplate && successRecords.length > 0) {
-    const templateDirAbs = resolve(opts.templateOutputPath, '..')
-    await mkdir(templateDirAbs, { recursive: true })
-    const templateData = successRecords.map(r => ({
-      email: r.email,
-      password: r.password,
-      refreshToken: r.refreshToken,
-      clientId: r.clientId,
-      clientSecret: r.clientSecret
-    }))
-    await writeFile(templateOutAbs, JSON.stringify(templateData, null, 2), { encoding: 'utf-8' })
-    log('green', `📁 模板文件已保存: ${templateOutAbs}`)
-    log('dim', `   (拿去切换工具用，别浪费了！)`)
+  // Merge with existing results file to preserve prior runs.
+  let existing: RunRecord[] = []
+  if (await fileExists(resultsAbs)) {
+    try {
+      const raw = await readFile(resultsAbs, 'utf-8')
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) existing = parsed as RunRecord[]
+    } catch {
+      existing = []
+    }
   }
+  const merged = existing.concat(records.filter(Boolean))
+  await writeFile(resultsAbs, JSON.stringify(merged, null, 2), 'utf-8')
+  log('green', `results: ${resultsAbs}`)
+  log('green', `sessions: ${resolve(opts.sessionsDir)}`)
 
   return { ok, fail }
 }
 
 async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<void> {
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout
-  })
-
-  const question = (prompt: string): Promise<string> => {
-    return new Promise((resolve) => {
-      rl.question(prompt, resolve)
-    })
-  }
-
-  const questionWithDefault = async (prompt: string, defaultValue: string): Promise<string> => {
-    const answer = await question(`${prompt} [默认: ${defaultValue}]: `)
-    return answer.trim() || defaultValue
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const question = (prompt: string): Promise<string> =>
+    new Promise((r) => rl.question(prompt, r))
+  const qd = async (prompt: string, def: string): Promise<string> => {
+    const a = await question(`${prompt} [${def}]: `)
+    return a.trim() || def
   }
 
   let currentOptions: CliOptions = { ...DEFAULT_OPTIONS, ...initialOptions }
   let running = true
 
-  const showBanner = () => {
+  const banner = () => {
     print('')
-    log('bright', '╔══════════════════════════════════════════════╗')
-    log('bright', '║  🤖 AWS 账号批量生产机 v1.0                  ║')
-    log('bright', '║     (白嫖 AWS，人人有责)                     ║')
-    log('bright', '╚══════════════════════════════════════════════╝')
+    log('bright', '╔════════════════════════════════════════════════╗')
+    log('bright', '║  Kiro Auto — Google OAuth registrar (v2)       ║')
+    log('bright', '║  app.kiro.dev/signin · camoufox stealth        ║')
+    log('bright', '╚════════════════════════════════════════════════╝')
   }
 
-  const showMenu = async () => {
-    showBanner()
+  const menu = async () => {
+    banner()
+    let available = 0
+    let total = 0
+    let failed = 0
+    let succeeded = 0
+    try {
+      const pool = await AccountPool.open(currentOptions.accountsPath, currentOptions.accountsStatePath)
+      available = pool.availableCount()
+      total = pool.totalCount()
+      failed = pool.failedCount()
+      succeeded = pool.successCount()
+    } catch {
+      total = -1
+    }
 
     print('')
-    log('dim', '┌─ ⚙️ 当前配置 ───────────────────────────────')
-    log('dim', `│ 要造几个: ${currentOptions.count} 个`)
-    log('dim', `│ 同时开几个: ${currentOptions.concurrency} 个`)
-    log('dim', `│ 每个隔多久: ${currentOptions.delayMs}ms`)
-    log('dim', `│ 隐身模式: ${currentOptions.incognitoMode ? '✅ 开着呢' : '❌ 关了'}`)
-    log('dim', `│ 指纹伪装: ${currentOptions.useFingerprint ? '✅ 伪装中' : '❌ 原始状态'}`)
-    log('dim', `│ 生成模板: ${currentOptions.emitBuilderIdTemplate ? '✅ 会生成' : '❌ 不生成'}`)
-    if (currentOptions.proxyUrl) {
-      log('dim', `│ 走代理: ${currentOptions.proxyUrl}`)
-    } else {
-      log('dim', `│ 走代理: 无 (直连，AWS 知道你是谁)`)
-    }
-    log('dim', '└─────────────────────────────────────────────')
+    log('dim', '┌─ Config ─────────────────────────────────────────')
+    log(
+      'dim',
+      `│ accounts: ${resolve(currentOptions.accountsPath)} ${
+        total >= 0 ? `(${available}/${total} unused · ok:${succeeded} fail:${failed})` : '(not found)'
+      }`
+    )
+    log('dim', `│ count: ${currentOptions.count}  concurrency: ${currentOptions.concurrency}  delay: ${currentOptions.delayMs}ms`)
+    log(
+      'dim',
+      `│ engine: ${currentOptions.engine}  headless: ${currentOptions.headless}  humanize: ${currentOptions.humanize}  geoip: ${currentOptions.geoip}`
+    )
+    log('dim', `│ fingerprint (chromium): ${currentOptions.useFingerprint}`)
+    log('dim', `│ proxy: ${currentOptions.proxyUrl ?? '(none)'}`)
+    log('dim', `│ sessions: ${resolve(currentOptions.sessionsDir)}`)
+    log('dim', '└──────────────────────────────────────────────────')
     print('')
-    log('cyan', '┌─ 🎮 操作菜单 ───────────────────────────────')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [1] 🚀 开始造号！')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [2] 改一下要造几个')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [3] 改一下并发数 (别太贪心)')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [4] 改一下间隔时间')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [5] 切换隐身模式')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [6] 切换指纹伪装')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [7] 切换是否生成模板')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [8] 设置代理 (不想被追踪就设一个)')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [9] 看看历史战绩')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [0] 退出 (不玩了)')
-    log('cyan', '└─────────────────────────────────────────────')
+    log('cyan', '[1] Start registration')
+    log('cyan', '[2] Set count')
+    log('cyan', '[3] Set concurrency')
+    log('cyan', '[4] Set delay (ms)')
+    log('cyan', '[5] Toggle headless')
+    log('cyan', '[6] Switch engine (camoufox → chromium-stealth → chromium-vanilla)')
+    log('cyan', '[7] Set proxy')
+    log('cyan', '[8] Set accounts file')
+    log('cyan', '[9] Toggle humanize (camoufox)')
+    log('cyan', '[a] Toggle geoip (camoufox)')
+    log('cyan', '[f] Toggle chromium fingerprint injection')
+    log('cyan', '[0] Quit')
     print('')
   }
 
-  const showHistory = async () => {
-    const resultPath = resolve(currentOptions.outputPath)
-    const templatePath = resolve(currentOptions.templateOutputPath)
-
-    print('')
-    log('cyan', '═══ 📊 历史战绩 ═══')
-
-    if (await fileExists(templatePath)) {
-      try {
-        const raw = await readFile(templatePath, 'utf-8')
-        const items = JSON.parse(raw)
-        log('green', `✅ 模板文件: ${templatePath}`)
-        log('dim', `   已有 ${Array.isArray(items) ? items.length : 0} 个账号躺在这里`)
-      } catch {
-        log('yellow', `⚠️ 模板文件读不了: ${templatePath}`)
-      }
-    } else {
-      log('yellow', `⚠️ 模板文件不存在: ${templatePath}`)
-      log('dim', `   (还没注册过账号吧？)`)
-    }
-
-    if (await fileExists(resultPath)) {
-      try {
-        const raw = await readFile(resultPath, 'utf-8')
-        const records = JSON.parse(raw)
-        const success = records.filter((r: any) => r.success).length
-        const failed = records.filter((r: any) => !r.success).length
-        log('dim', `📝 结果文件: ${resultPath}`)
-        log('dim', `   总共 ${records.length} 条记录 (成功: ${success}, 失败: ${failed})`)
-        if (failed > success) {
-          log('yellow', `   (失败率有点高啊，是不是 AWS 发现你了？)`)
-        }
-      } catch {
-        log('yellow', `⚠️ 结果文件读不了: ${resultPath}`)
-      }
-    } else {
-      log('yellow', `⚠️ 结果文件不存在: ${resultPath}`)
-    }
-  }
-
-  await showMenu()
-
+  await menu()
   while (running) {
-    const input = await question(COLORS.green + '选个数字 [0-9] > ' + COLORS.reset)
-    const cmd = input.trim()
-
+    const cmd = (await question(COLORS.green + '> ' + COLORS.reset)).trim().toLowerCase()
     switch (cmd) {
-      case '1': {
+      case '1':
         print('')
-        log('cyan', '🔥 开始造号！AWS 准备好接招了吗？')
-        log('dim', '───────────────────────────────────────')
-        const result = await runRegistration(currentOptions)
-        log('dim', '───────────────────────────────────────')
-        if (result.ok > 0) {
-          log('magenta', `\n🎉 收工！成功造了 ${result.ok} 个账号！`)
-        }
+        await runRegistration(currentOptions)
         break
-      }
-
       case '2': {
-        const answer = await questionWithDefault('要造几个账号', String(currentOptions.count))
-        const val = toInt(answer, currentOptions.count)
-        if (val < 1) {
-          log('red', '至少造 1 个吧，你输入的是啥？')
-        } else if (val > 50) {
-          currentOptions.count = val
-          log('yellow', `⚠️ 设置为 ${val} 个...你这是要搞大事啊，小心被封`)
-        } else {
-          currentOptions.count = val
-          log('green', `✓ 好的，准备造 ${val} 个账号`)
-        }
+        const v = toInt(await qd('count', String(currentOptions.count)), currentOptions.count)
+        currentOptions.count = Math.max(1, v)
         break
       }
-
       case '3': {
-        const answer = await questionWithDefault('并发数', String(currentOptions.concurrency))
-        const val = toInt(answer, currentOptions.concurrency)
-        if (val < 1) {
-          log('red', '并发数至少 1 个，别闹')
-        } else if (val > 5) {
-          currentOptions.concurrency = val
-          log('yellow', `⚠️ 并发 ${val} 个...你的电脑扛得住吗？`)
-        } else {
-          currentOptions.concurrency = val
-          log('green', `✓ 并发数设为 ${val}`)
-        }
+        const v = toInt(await qd('concurrency', String(currentOptions.concurrency)), currentOptions.concurrency)
+        currentOptions.concurrency = Math.max(1, v)
         break
       }
-
       case '4': {
-        const answer = await questionWithDefault('任务间隔(ms)', String(currentOptions.delayMs))
-        const val = toInt(answer, currentOptions.delayMs)
-        if (val < 0) {
-          log('red', '时间不能倒流，输入正数')
-        } else {
-          currentOptions.delayMs = val
-          if (val === 0) {
-            log('green', `✓ 不设间隔，全速前进！(AWS: 救命)`)
-          } else {
-            log('green', `✓ 间隔设为 ${val}ms，稳一点好`)
-          }
-        }
+        const v = toInt(await qd('delayMs', String(currentOptions.delayMs)), currentOptions.delayMs)
+        currentOptions.delayMs = Math.max(0, v)
         break
       }
-
-      case '5': {
-        currentOptions.incognitoMode = !currentOptions.incognitoMode
-        if (currentOptions.incognitoMode) {
-          log('green', '✓ 隐身模式已开启 (浏览器不留痕迹)')
-        } else {
-          log('yellow', '⚠️ 隐身模式已关闭 (你确定？会留痕迹的)')
-        }
+      case '5':
+        currentOptions.headless = !currentOptions.headless
         break
-      }
-
-      case '6': {
-        currentOptions.useFingerprint = !currentOptions.useFingerprint
-        if (currentOptions.useFingerprint) {
-          log('green', '✓ 指纹伪装已开启 (每个浏览器看起来都不一样)')
-        } else {
-          log('yellow', '⚠️ 指纹伪装已关闭 (AWS 可能会认出你)')
-        }
+      case '6':
+        currentOptions.engine =
+          currentOptions.engine === 'camoufox'
+            ? 'chromium-stealth'
+            : currentOptions.engine === 'chromium-stealth'
+              ? 'chromium-vanilla'
+              : 'camoufox'
         break
-      }
-
       case '7': {
-        currentOptions.emitBuilderIdTemplate = !currentOptions.emitBuilderIdTemplate
-        if (currentOptions.emitBuilderIdTemplate) {
-          log('green', '✓ 会生成模板文件 (方便切换工具使用)')
-        } else {
-          log('yellow', '⚠️ 不生成模板 (注册了也白注册)')
-        }
+        const a = await question(`proxy [${currentOptions.proxyUrl ?? ''}]: `)
+        currentOptions.proxyUrl = a.trim() ? a.trim() : undefined
         break
       }
-
-      case '8': {
-        const current = currentOptions.proxyUrl || '无'
-        const answer = await question(`代理地址 (留空清除) [当前: ${current}]: `)
-        if (answer.trim() === '') {
-          currentOptions.proxyUrl = undefined
-          log('green', '✓ 代理已清除 (直连 AWS)')
-        } else {
-          currentOptions.proxyUrl = answer.trim()
-          log('green', `✓ 代理设为: ${answer.trim()}`)
-          log('dim', '  (希望你的代理靠谱)')
-        }
+      case '8':
+        currentOptions.accountsPath = await qd('accounts file', currentOptions.accountsPath)
         break
-      }
-
-      case '9': {
-        await showHistory()
+      case '9':
+        currentOptions.humanize = !currentOptions.humanize
         break
-      }
-
+      case 'a':
+        currentOptions.geoip = !currentOptions.geoip
+        break
+      case 'f':
+        currentOptions.useFingerprint = !currentOptions.useFingerprint
+        break
       case '0':
       case 'q':
       case 'exit':
       case 'quit':
         running = false
-        print('')
-        log('green', '👋 拜拜！记得用切换工具把账号用起来~')
+        log('green', 'bye')
         break
-
       default:
-        log('yellow', `输入 "${input}" 是啥意思？请输入 0-9`)
+        log('yellow', `unknown: ${cmd}`)
         break
     }
-
-    if (running && cmd !== '9') {
+    if (running) {
       print('')
-      await showMenu()
+      await menu()
     }
   }
-
   rl.close()
 }
 
 async function main() {
   const cliArgs = parseArgs(process.argv.slice(2))
   const hasCliArgs = Object.keys(cliArgs).length > 0
-  const nonInteractive = process.argv.includes('--non-interactive') || process.argv.includes('-y')
+  const nonInteractive =
+    process.argv.includes('--non-interactive') || process.argv.includes('-y')
 
   if (hasCliArgs && nonInteractive) {
     const opts: CliOptions = { ...DEFAULT_OPTIONS, ...cliArgs }
@@ -588,6 +466,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  process.stderr.write(`💥 出大事了: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`)
+  process.stderr.write(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`)
   process.exitCode = 1
 })
