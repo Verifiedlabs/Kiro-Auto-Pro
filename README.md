@@ -145,9 +145,6 @@ Akun sudah Pro tapi state bilang failed? Run `npm run upgrade` lagi — Pro badg
 
 Reset state: delete `accounts/*.state.json` atau `show/upgrade-state.json`.
 
-## Disclaimer
-
-For personal automation of accounts you own. Patuhi Google Workspace TOS, Kiro TOS, dan hukum lokal.
 
 ## BIN Search / Finder / Generator
 
